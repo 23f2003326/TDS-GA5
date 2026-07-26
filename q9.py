@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 PROFILE = "ga5-mailroom-action-gate/v2"
 
+# Bump this any time deterministic_decision / SYSTEM_PROMPT / shape_action /
+# verify_receipt_signatures changes. Without this, a stale cached proposal
+# (keyed only by dossierId+content fingerprint) or a stale eval replay would
+# silently keep serving pre-fix answers forever, no matter what the code says.
+CACHE_VERSION = "v4"
+
 ACTIONS = (
     "create_draft",
     "update_internal_record",
@@ -148,32 +154,34 @@ def _put(sql, params):
         logger.error(f"DB put error: {e}")
 
 def get_eval(eval_id: str):
-    if eval_id in IN_MEMORY_EVALS:
-        return IN_MEMORY_EVALS[eval_id]
+    vkey = CACHE_VERSION + "|" + eval_id
+    if vkey in IN_MEMORY_EVALS:
+        return IN_MEMORY_EVALS[vkey]
 
-    eval_file = os.path.join(tempfile.gettempdir(), f"q9_eval_{eval_id}.json")
+    eval_file = os.path.join(tempfile.gettempdir(), f"q9_eval_{CACHE_VERSION}_{eval_id}.json")
     if os.path.exists(eval_file):
         try:
             with open(eval_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 val = (data["inputDigest"], data["response"])
-                IN_MEMORY_EVALS[eval_id] = val
+                IN_MEMORY_EVALS[vkey] = val
                 return val
         except Exception:
             pass
 
-    row = _get("q9_v3_evals", "eval_id", eval_id)
+    row = _get("q9_v3_evals", "eval_id", vkey)
     if row is not None:
         val = (row[1], json.loads(row[2]))
-        IN_MEMORY_EVALS[eval_id] = val
+        IN_MEMORY_EVALS[vkey] = val
         return val
 
     return None
 
 def put_eval(eval_id: str, input_digest: str, response_dict: dict):
-    IN_MEMORY_EVALS[eval_id] = (input_digest, response_dict)
+    vkey = CACHE_VERSION + "|" + eval_id
+    IN_MEMORY_EVALS[vkey] = (input_digest, response_dict)
 
-    eval_file = os.path.join(tempfile.gettempdir(), f"q9_eval_{eval_id}.json")
+    eval_file = os.path.join(tempfile.gettempdir(), f"q9_eval_{CACHE_VERSION}_{eval_id}.json")
     try:
         tmp_f = eval_file + ".tmp"
         with open(tmp_f, "w", encoding="utf-8") as f:
@@ -182,7 +190,7 @@ def put_eval(eval_id: str, input_digest: str, response_dict: dict):
     except Exception as e:
         logger.error(f"Error saving eval file: {e}")
 
-    _put("INSERT OR REPLACE INTO q9_v3_evals VALUES (?,?,?)", (eval_id, input_digest, json.dumps(response_dict, ensure_ascii=False)))
+    _put("INSERT OR REPLACE INTO q9_v3_evals VALUES (?,?,?)", (vkey, input_digest, json.dumps(response_dict, ensure_ascii=False)))
 
 IN_MEMORY_VERIFIERS = {}
 
@@ -823,7 +831,7 @@ async def do_propose(body):
     # Level 1: Persistent Cache & Level 2: Dynamic Deterministic Solver
     cached, pending, resolved = {}, [], {}
     for did, fp, d in zip(ids, fingerprints, dossiers):
-        hit = _get("q9_v3_decisions", "cache_key", did + "|" + fp)
+        hit = _get("q9_v3_decisions", "cache_key", CACHE_VERSION + "|" + did + "|" + fp)
         if hit is not None:
             cached[did] = json.loads(hit[1])
             continue
@@ -845,7 +853,7 @@ async def do_propose(body):
             proposal = build_proposal(did, d, fp, raw or {})
             blob = canonical(proposal)
             if raw is not None:
-                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + "|" + fp, blob))
+                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (CACHE_VERSION + "|" + did + "|" + fp, blob))
             _put("INSERT OR REPLACE INTO q9_v3_calls VALUES (?,?)", (proposal["callId"], blob))
         _put("INSERT OR REPLACE INTO q9_v3_eval_calls VALUES (?,?)", (eval_id + "|" + proposal["callId"], canonical(proposal)))
         proposals.append(proposal)
