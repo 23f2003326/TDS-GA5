@@ -176,7 +176,7 @@ async def llm_diagnosis(incident: Dict[str, Any]) -> Dict[str, Any]:
         'Reply with ONLY JSON: {"rootCause": "<one allowed value>", "evidence": ["ev_...", "ev_..."]}'
     )
     try:
-        result = await call_llm_json(prompt, timeout=15.0)
+        result = await call_llm_json(prompt, timeout=10.0)
         root_cause = result.get("rootCause") if isinstance(result, dict) else None
         evidence = result.get("evidence") if isinstance(result, dict) else None
         valid_ids = {eid for eid, _t in lines}
