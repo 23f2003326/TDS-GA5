@@ -12,10 +12,26 @@ OPENROUTER_MODEL = os.environ.get(
     "nvidia/nemotron-3-ultra-550b-a55b:free"
 )
 
-_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+# IMPORTANT: build the client lazily / defensively. openai>=1.0's client
+# constructor raises immediately if no api_key is resolvable (neither the
+# explicit arg nor OPENAI_API_KEY env var). Since llm.py is imported at
+# module load time by q10.py and q11.py, and those are imported at module
+# load time by main.py, an eager crash here takes down the ENTIRE monolith
+# (every question, not just the ones using the LLM) - which is what "all
+# categories 0/7" almost always means. Never let a missing key crash import.
+_client = None
+if OPENROUTER_API_KEY:
+    try:
+        _client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+    except Exception as e:
+        print(f"WARNING: could not construct OpenRouter client: {e}", flush=True)
+        _client = None
+else:
+    print("WARNING: OPENROUTER_API_KEY not set - LLM calls will fall back "
+          "to heuristics everywhere.", flush=True)
 
 
 def _strip_fence(text: str) -> str:
@@ -39,10 +55,12 @@ def _extract_json_object(text: str):
 async def call_llm_json(prompt: str, timeout: float = 15.0) -> dict:
     """
     Calls OpenRouter LLM and parses JSON output.
-    Returns parsed dict or list.
-
-    Unchanged - other questions (q9, etc.) depend on this exact signature.
+    Returns parsed dict or list. Returns {} (never raises) if no client is
+    configured or the call/parse fails, so callers can rely on their own
+    heuristic fallback.
     """
+    if _client is None:
+        return {}
     try:
         response = await asyncio.wait_for(
             _client.chat.completions.create(
@@ -70,9 +88,11 @@ async def chat_json(messages, max_tokens: int = 2048, timeout: float = 35.0) -> 
     prompt string, since q10's batch prompts need a separate system message.
     Reuses the same OpenRouter client/model as call_llm_json above.
 
-    Returns {} on any failure so callers fall back to their own heuristics
-    instead of crashing.
+    Returns {} on any failure (including no client configured) so callers
+    fall back to their own heuristics instead of crashing.
     """
+    if _client is None:
+        return {}
     try:
         response = await asyncio.wait_for(
             _client.chat.completions.create(

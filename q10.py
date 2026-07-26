@@ -36,7 +36,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
-from llm import chat_json
+try:
+    from llm import chat_json
+except Exception:  # pragma: no cover
+    async def chat_json(*args, **kwargs):
+        return {}
 
 A2A_MEDIA_TYPE = "application/a2a+json"
 JSON_MEDIA_TYPE = "application/json"
