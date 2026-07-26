@@ -6,6 +6,21 @@ processes the grader's authoritative outcomes (handling a single 503 retry and
 suppressing effects after a diagnostic timeout), gates destructive effects
 behind an explicit approval receipt, and returns a stored, replayable final
 result together with an OTLP trace whose spans/attributes match the spec.
+
+FIXES vs previous version:
+  1. Diagnostic dispatches no longer all cite the same evidence ID - each
+     dispatch cycles to a distinct ID from the diagnosis's evidence list.
+  2. On a 503, the ORIGINAL attempt's CLIENT span (not the retry span) now
+     gets status code 2 / error.type="503" / resend_count 0. The new retry
+     span starts clean (resend_count 1) and only becomes an error span if its
+     own outcome says so.
+  3. Every outcome receipt (success, failure, timeout, 503) now writes
+     ga5.receipt.id / ga5.receipt.nonce / http.response.status_code onto the
+     matching CLIENT span - previously only the timeout/503 paths touched the
+     span at all, so successful actions never got receipt correlation data.
+  4. Receipt de-duplication state is now persisted inside the stored run
+     (survives process restarts on platforms like Render free tier that spin
+     down idle instances), instead of living only in a process-memory dict.
 """
 
 import hashlib
@@ -32,7 +47,6 @@ DESTRUCTIVE_DEFAULT = ("rollback_deployment", "disable_feature")
 # --------------------------------------------------------------- persistence
 
 IN_MEMORY_RUNS: Dict[str, Dict[str, Any]] = {}
-IN_MEMORY_RECEIPTS: Dict[str, Dict[str, str]] = {}  # runId -> {receiptId: bodyDigest}
 
 
 def _run_file(run_id: str) -> str:
@@ -67,9 +81,12 @@ def save_run(run_id: str, state: Dict[str, Any]) -> None:
         pass
 
 
-def mark_receipt(run_id: str, receipt_id: str, body_digest: str) -> Optional[str]:
-    """Returns the previously stored digest for (run_id, receipt_id), or None if new."""
-    bucket = IN_MEMORY_RECEIPTS.setdefault(run_id, {})
+def mark_receipt(state: Dict[str, Any], receipt_id: str, body_digest: str) -> Optional[str]:
+    """Returns the previously stored digest for this receiptId within this run's
+    persisted state, or None if this is the first time we've seen it. Storing
+    this inside `state` (rather than a process-only dict) means replay/conflict
+    detection survives a server restart."""
+    bucket = state.setdefault("receiptDigests", {})
     prior = bucket.get(receipt_id)
     if prior is None:
         bucket[receipt_id] = body_digest
@@ -151,10 +168,23 @@ def heuristic_diagnosis(transcript: str, allowed_root_causes: List[str]) -> Dict
             best_score = score
             root_cause = cause
 
-    evidence_ids = [eid for eid, _t in pool[:4]] or [eid for eid, _t in lines[:4]]
-    if not evidence_ids:
-        evidence_ids = ["ev_00000000"]
-    return {"rootCause": root_cause, "evidence": evidence_ids[:4] if len(evidence_ids) >= 2 else (evidence_ids * 2)[:2]}
+    # dedupe while preserving order, and never fabricate duplicate IDs
+    seen = []
+    for eid, _t in pool:
+        if eid not in seen:
+            seen.append(eid)
+        if len(seen) == 4:
+            break
+    if len(seen) < 2:
+        for eid, _t in lines:
+            if eid not in seen:
+                seen.append(eid)
+            if len(seen) == 4:
+                break
+    if not seen:
+        seen = ["ev_00000000"]
+    evidence_ids = seen if len(seen) >= 2 else seen  # leave as-is if genuinely only 1 exists
+    return {"rootCause": root_cause, "evidence": evidence_ids}
 
 
 def _heuristic_pick_diagnostics(diagnosis: Dict[str, Any], incident: Dict[str, Any],
@@ -241,7 +271,10 @@ async def llm_full_plan(incident: Dict[str, Any], tool_catalog: List[Dict[str, A
         if isinstance(root_cause, str) and root_cause in allowed:
             diagnosis["rootCause"] = root_cause
         if isinstance(evidence, list):
-            clean_ev = [e for e in evidence if e in valid_ids]
+            clean_ev = []
+            for e in evidence:
+                if e in valid_ids and e not in clean_ev:
+                    clean_ev.append(e)
             if 2 <= len(clean_ev) <= 4:
                 diagnosis["evidence"] = clean_ev
 
@@ -332,6 +365,32 @@ def new_span(trace_id, span_id, parent_span_id, name, kind, run_id, public_marke
     return span
 
 
+def _find_span(state: Dict[str, Any], span_id: str) -> Optional[Dict[str, Any]]:
+    for s in state["spans"]:
+        if s["spanId"] == span_id:
+            return s
+    return None
+
+
+def _apply_receipt_to_span(state: Dict[str, Any], span_id: str, receipt_id: str,
+                            nonce: Optional[str], http_status: Optional[int],
+                            error_type: Optional[str] = None) -> None:
+    """Attach receipt correlation + observed status to the CLIENT span for one attempt.
+    Called exactly once per resolved attempt, regardless of outcome (success, failure,
+    timeout, or the 503 that triggered a retry)."""
+    span = _find_span(state, span_id)
+    if span is None:
+        return
+    span["attributes"].append(otlp_attr("ga5.receipt.id", receipt_id))
+    span["attributes"].append(otlp_attr("ga5.receipt.nonce", nonce or ""))
+    if isinstance(http_status, int):
+        span["attributes"].append(otlp_attr("http.response.status_code", http_status))
+    if error_type:
+        span["status"]["code"] = 2
+        span["attributes"].append(otlp_attr("error.type", error_type))
+    # successful spans keep status code 0 (UNSET) and never get error.type
+
+
 # ---------------------------------------------------------------- endpoints
 
 @router.post("/v2/incidents")
@@ -409,19 +468,24 @@ async def create_incident(request: Request):
     dispatches = []
     diag_action_ids = []
 
-    for planned in diagnostic_plan:
+    # FIX: cycle through the diagnosis's evidence IDs instead of always citing
+    # evidence[0] for every dispatch, so distinct diagnostic calls don't all
+    # cite the same (duplicate) evidence ID.
+    evidence_pool = diagnosis["evidence"] or []
+    for idx, planned in enumerate(diagnostic_plan):
         tool_name = planned.get("toolName", "unknown_tool")
         action_id = stable_id(run_id, "diag", tool_name)
         call_id = action_id
         span_id = new_span_id()
         args = planned.get("arguments") or {}
+        cited_evidence = [evidence_pool[idx % len(evidence_pool)]] if evidence_pool else []
         dispatch = {
             "actionId": action_id,
             "callId": call_id,
             "phase": "diagnostic",
             "toolName": tool_name,
             "arguments": args,
-            "evidence": diagnosis["evidence"][:1],
+            "evidence": cited_evidence,
             "attempt": 1,
             "traceparent": make_traceparent(trace_id, span_id),
         }
@@ -477,6 +541,7 @@ async def create_incident(request: Request):
         "approvals": {},
         "actionLog": action_log,
         "receiptLog": [],
+        "receiptDigests": {},
         "spans": spans,
         "suppressed": [],
         "chosenEffect": None,
@@ -616,11 +681,14 @@ async def post_receipts(run_id: str, request: Request):
         raise HTTPException(status_code=422, detail="receiptId is required")
 
     body_digest = digest(body)
-    prior_digest = mark_receipt(run_id, receipt_id, body_digest)
+    prior_digest = mark_receipt(state, receipt_id, body_digest)
     if prior_digest is not None:
         if prior_digest != body_digest:
             raise HTTPException(status_code=409, detail="receiptId already used with different content")
         return _final_body(state)
+    # persist the digest immediately so a crash/restart mid-processing still
+    # treats this receiptId as seen when it's retried with identical content
+    save_run(run_id, state)
 
     outcomes = body.get("outcomes")
     approvals_in = body.get("approvals")
@@ -641,6 +709,7 @@ async def post_receipts(run_id: str, request: Request):
 
             status = outcome.get("status")
             error_type = outcome.get("errorType")
+            nonce = outcome.get("nonce")
             receipt_record = {
                 "receiptId": receipt_id,
                 "actionId": action_id,
@@ -648,11 +717,15 @@ async def post_receipts(run_id: str, request: Request):
                 "attempt": attempt,
                 "status": status,
                 "resultClass": outcome.get("resultClass"),
-                "nonce": outcome.get("nonce"),
+                "nonce": nonce,
             }
             state["receiptLog"].append(receipt_record)
 
             if status == 503 and attempt == 1:
+                # FIX: the 503 describes THIS attempt's outcome, so the error
+                # status/type/receipt-correlation belongs on attempt 1's own
+                # span - not on the fresh retry span.
+                _apply_receipt_to_span(state, att["spanId"], receipt_id, nonce, 503, error_type="503")
                 att["status"] = "retried"
                 new_attempt = attempt + 1
                 new_span_id_ = new_span_id()
@@ -670,27 +743,26 @@ async def post_receipts(run_id: str, request: Request):
                 new_dispatches.append(new_dispatch)
                 state["actionLog"].append(dict(new_dispatch))
                 exec_span_id = action.get("execSpanId")
+                # retry span starts clean (no error) - it only becomes an error
+                # span if ITS OWN receipt later says so
                 state["spans"].append(new_span(
                     state["traceId"], new_span_id_, exec_span_id, f"POST tool/{action['toolName']}", 3,
                     run_id, state["publicMarker"],
                     [otlp_attr("ga5.action.id", action_id), otlp_attr("ga5.attempt", new_attempt),
                      otlp_attr("http.request.method", "POST"), otlp_attr("http.request.resend_count", 1)],
-                    error_type="503",
                 ))
                 continue
 
             if status == 0 and error_type == "timeout":
+                _apply_receipt_to_span(state, att["spanId"], receipt_id, nonce, None, error_type="timeout")
                 att["status"] = "timeout"
                 action["outcome"] = "timeout"
                 if action_id not in state["suppressed"]:
                     state["suppressed"].append(action_id)
-                exec_span_id = action.get("execSpanId")
-                for s in state["spans"]:
-                    if s["spanId"] == att["spanId"]:
-                        s["status"] = {"code": 2}
-                        s["attributes"].append(otlp_attr("error.type", "timeout"))
                 continue
 
+            # success or any other terminal (non-503, non-timeout) status
+            _apply_receipt_to_span(state, att["spanId"], receipt_id, nonce, status if isinstance(status, int) else None)
             att["status"] = "succeeded" if status == 200 else "failed"
             action["outcome"] = outcome.get("resultClass") if status == 200 else "failed"
 
