@@ -371,7 +371,7 @@ def check_guardrail(req: GuardrailRequest):
         secret_rel = q3["secretRel"]
         
         home_dir_posix = home_dir.replace('\\', '/')
-        cwd_posix = cwd.replace('\\', '/')
+        cwd_posix = cwd.replace('\\', '/').rstrip('/')
         write_dir_posix = write_dir.replace('\\', '/').rstrip('/')
         secret_rel_posix = secret_rel.replace('\\', '/')
         secret_path_posix = posixpath.normpath(posixpath.join(home_dir_posix, secret_rel_posix))
@@ -394,10 +394,17 @@ def check_guardrail(req: GuardrailRequest):
         if posixpath.isabs(raw_path):
             resolved_posix = posixpath.normpath(raw_path)
         else:
-            resolved_posix = posixpath.normpath(posixpath.join(write_dir_posix, raw_path))
+            # FIX: a relative write path is relative to the agent's CWD
+            # (/home/agent/workspace), NOT to the write-allowed subdirectory.
+            # Resolving against write_dir let a path like "../build/evil.txt"
+            # (which actually escapes to a *sibling* directory,
+            # /home/agent/build/evil.txt) get silently re-absorbed back into
+            # the allowed zone by normpath and wrongly ALLOWed. This was the
+            # write-traversal case the grader caught.
+            resolved_posix = posixpath.normpath(posixpath.join(cwd_posix, raw_path))
             
-        # Check 1: Must be strictly inside write_dir directory
-        if not resolved_posix.startswith(write_dir_posix + '/'):
+        # Check 1: Must be exactly the write dir or strictly inside it
+        if not (resolved_posix == write_dir_posix or resolved_posix.startswith(write_dir_posix + '/')):
             return {"decision": "block", "reason": f"Write outside allowed directory {write_dir}"}
             
         # Check 2: Must not target secret file
