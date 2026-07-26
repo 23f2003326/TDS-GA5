@@ -137,14 +137,11 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
         if is_ip_private_or_restricted(ip_obj):
             return {"action": "block", "reason": f"SSRF block: private/loopback IP {hostname}"}
 
-    # Open Redirect / Redirect SSRF Detection in Query Parameters
-    # Check if URL path or query parameter is a redirect parameter pointing to a private/internal target
     path_lower = parsed.path.lower()
     query_unquoted = urllib.parse.unquote(parsed.query)
 
     REDIRECT_PARAMS = ["next", "redirect", "return", "goto", "dest", "destination", "target", "forward", "to", "url", "rurl"]
-    
-    # Parse query dict
+
     query_params = urllib.parse.parse_qs(parsed.query)
     is_redirect_probe = "redirect" in path_lower or any(p in query_params for p in REDIRECT_PARAMS)
 
@@ -190,14 +187,13 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
     except Exception:
         return {"action": "allow", "reason": "URL fetch permitted", "result": f"Content retrieved from {hostname}"}
 
-@router.post("/check")
-async def check_redteam(req: RedteamRequest, request: Request):
+def _run_redteam_check(req: RedteamRequest) -> dict:
     from main import CONFIG
     if not CONFIG or "q8" not in CONFIG:
         return {"action": "block", "reason": "Server not configured with STUDENT_EMAIL"}
-    
+
     q8_cfg = CONFIG["q8"]
-    
+
     if req.tool == "read_file":
         path = req.arguments.get("path", "")
         return check_read_file(path, q8_cfg)
@@ -206,3 +202,13 @@ async def check_redteam(req: RedteamRequest, request: Request):
         return check_fetch_url(url, q8_cfg)
     else:
         return {"action": "block", "reason": f"Unknown tool: {req.tool}"}
+
+# This is the exact URL the grader submits to: /ga5/{email}/guardrail-redteam
+@router.post("/ga5/{email}/guardrail-redteam")
+async def guardrail_redteam(email: str, req: RedteamRequest):
+    return _run_redteam_check(req)
+
+# Extra convenience route (not required by grader, kept for manual testing)
+@router.post("/check")
+async def check_redteam(req: RedteamRequest, request: Request):
+    return _run_redteam_check(req)
