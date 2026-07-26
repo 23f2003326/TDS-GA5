@@ -51,8 +51,7 @@ def is_ip_private_or_restricted(ip_obj) -> bool:
     )
 
 def _resolve_full_path(sandbox_root: str, cleaned_path: str) -> str:
-    # leading "/" ka matlab yaha "sandbox se root-relative" hai, filesystem-absolute nahi
-    # (grader kabhi "/notes/x.txt" bhi bhej sakta hai sandbox-relative sense mein)
+    # leading "/" ka matlab yaha "sandbox-relative" hai, filesystem-absolute nahi
     trimmed = cleaned_path.lstrip('/') if cleaned_path.startswith('/') else cleaned_path
     return os.path.abspath(os.path.join(sandbox_root, trimmed))
 
@@ -66,8 +65,8 @@ def check_read_file(path_arg: str, q8_config: dict) -> dict:
     if "\x00" in path_arg or "%00" in path_arg:
         return {"action": "block", "reason": "Null byte in path"}
 
-    # --- FIX: pehle literal/raw path try karo (koi decode nahi) ---
-    # taaki "%2e%2e-literal.txt" jaisa REAL filename corrupt na ho jaaye unquote se.
+    # --- FIX 1: raw/literal path pehle try karo, koi decode nahi ---
+    # taaki "%2e%2e-literal.txt" jaisa REAL filename unquote se corrupt na ho.
     literal_full_path = _resolve_full_path(sandbox_root, path_arg.replace('\\', '/'))
     try:
         literal_common = os.path.commonpath([sandbox_root, os.path.realpath(literal_full_path)])
@@ -86,7 +85,7 @@ def check_read_file(path_arg: str, q8_config: dict) -> dict:
         except Exception as e:
             return {"action": "block", "reason": f"Failed to read file: {e}"}
 
-    # --- literal path pe file nahi mili, ab decode karke traversal-detection try karo ---
+    # --- literal path pe file nahi mili, ab decode karke traversal-detection ---
     norm_path = path_arg
     if norm_path.startswith("base64:"):
         import base64
@@ -146,7 +145,6 @@ def _host_is_blocked_host(host: Optional[str]) -> bool:
     ip = parse_possible_ip(host)
     if ip and is_ip_private_or_restricted(ip):
         return True
-    # DNS rebinding guard: hostname allowlisted ho sakta hai but resolve private IP pe
     try:
         infos = socket.getaddrinfo(host, None)
         for info in infos:
@@ -200,9 +198,7 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
     if not host_allowed:
         return {"action": "block", "reason": f"SSRF block: host not in allowlist: {hostname}"}
 
-    # --- FIX: redirects sirf inspect nahi, safely FOLLOW bhi karo (max 3 hops) ---
-    # taaki benign hosts jo http->https redirect karte hain (jaise iana.org), unka
-    # actual content mile na ki empty redirect stub.
+    # --- FIX 2: redirects sirf inspect nahi, safely FOLLOW bhi karo (max 3 hops) ---
     current_url = url_arg
     try:
         with httpx.Client(timeout=8.0, follow_redirects=False) as client:
@@ -226,7 +222,9 @@ def check_fetch_url(url_arg: str, q8_config: dict) -> dict:
     except Exception:
         return {"action": "allow", "reason": "URL fetch permitted", "result": f"Content retrieved from {hostname}"}
 
-def _run_redteam_check(req: RedteamRequest) -> dict:
+@router.post("/check")
+async def check_redteam(req: RedteamRequest, request: Request):
+    # --- FIX 3: poora handler try/except mein — kabhi raw 500 nahi jaana chahiye ---
     try:
         from main import CONFIG
     except Exception as e:
@@ -247,15 +245,4 @@ def _run_redteam_check(req: RedteamRequest) -> dict:
         else:
             return {"action": "block", "reason": f"Unknown tool: {req.tool}"}
     except Exception as e:
-        # --- FIX: kabhi bhi raw 500 nahi bhejna, grader clean JSON expect karta hai ---
         return {"action": "block", "reason": f"Internal error while checking request: {e}"}
-
-# This is the exact URL the grader submits to: /ga5/{email}/guardrail-redteam
-@router.post("/ga5/{email}/guardrail-redteam")
-async def guardrail_redteam(email: str, req: RedteamRequest):
-    return _run_redteam_check(req)
-
-# Extra convenience route (not required by grader, kept for manual testing)
-@router.post("/check")
-async def check_redteam(req: RedteamRequest, request: Request):
-    return _run_redteam_check(req)
