@@ -12,6 +12,16 @@ OPENROUTER_MODEL = os.environ.get(
     "nvidia/nemotron-3-ultra-550b-a55b:free"
 )
 
+
+class LLMUnavailable(Exception):
+    """Raised/importable by callers (e.g. q9.py) that need to distinguish
+    "no provider configured" from other failures. llm.py itself never
+    raises this - call_llm_json/chat_json always return {} on failure so
+    they never crash a caller. It exists purely so `from llm import
+    LLMUnavailable` succeeds."""
+    pass
+
+
 # IMPORTANT: build the client lazily / defensively. openai>=1.0's client
 # constructor raises immediately if no api_key is resolvable (neither the
 # explicit arg nor OPENAI_API_KEY env var). Since llm.py is imported at
@@ -32,6 +42,13 @@ if OPENROUTER_API_KEY:
 else:
     print("WARNING: OPENROUTER_API_KEY not set - LLM calls will fall back "
           "to heuristics everywhere.", flush=True)
+
+
+def available() -> bool:
+    """True iff a usable LLM client is configured. Callers (e.g. q9.py's
+    run_model) check this before doing any batching/chunking work, so it
+    must never raise and must reflect the real client state."""
+    return _client is not None
 
 
 def _strip_fence(text: str) -> str:
@@ -72,10 +89,7 @@ async def call_llm_json(prompt: str, timeout: float = 15.0) -> dict:
             timeout=timeout,
         )
         text = (response.choices[0].message.content or "").strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```[a-z]*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text).strip()
-        return json.loads(text)
+        return _extract_json_object(text)
     except Exception as e:
         print(f"WARNING: OpenRouter LLM call failed or timed out: {e}", flush=True)
         return {}
@@ -83,9 +97,9 @@ async def call_llm_json(prompt: str, timeout: float = 15.0) -> dict:
 
 async def chat_json(messages, max_tokens: int = 2048, timeout: float = 35.0) -> dict:
     """
-    Used by q10.py. Takes a full OpenAI-style messages list
+    Used by q9.py / q10.py. Takes a full OpenAI-style messages list
     ([{"role": "system"/"user", "content": ...}, ...]) instead of a single
-    prompt string, since q10's batch prompts need a separate system message.
+    prompt string, since batch prompts need a separate system message.
     Reuses the same OpenRouter client/model as call_llm_json above.
 
     Returns {} on any failure (including no client configured) so callers
