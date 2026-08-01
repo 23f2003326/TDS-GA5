@@ -413,7 +413,10 @@ async def _call_provider(user_msg, base_url, api_key, model, timeout):
         res = await asyncio.wait_for(loop.run_in_executor(None, _do_call), timeout=timeout + 3)
         txt = res["choices"][0]["message"]["content"]
         return _extract_json(txt)
-    except Exception:
+    except Exception as e:
+        import sys, traceback
+        print("MAILROOM_LLM_ERROR:", repr(e), file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return {}
 
 
